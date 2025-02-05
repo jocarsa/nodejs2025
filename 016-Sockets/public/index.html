@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>jocarsa | navajowhite</title>
+  <link rel="stylesheet" href="main.css" />
+  <!-- Socket.io client library -->
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+  <!-- Login Overlay -->
+  <div id="loginOverlay">
+    <div id="loginBox">
+      <img src="navajowhite.png">
+      <h1>jocarsa | navajowhite</h1>
+      <h2>Bienvenidos</h2>
+      <input id="usernameInput" type="text" placeholder="Introduce tu nombre" />
+      <button id="joinBtn">Unirte a la videoconferencia</button>
+    </div>
+  </div>
+
+  <!-- Main Conference Container (hidden until user joins) -->
+  <div id="conferenceContainer" class="hidden">
+    <!-- Top Bar for toggling camera/mic/screen -->
+    <div id="controlsBar">
+      <h1>
+        <img src="navajowhite.png" />
+        jocarsa | navajowhite
+      </h1>
+      <div id="controles">
+        <button id="toggleCameraBtn">
+          <img src="camaraoff.svg" id="iconocamara" />
+        </button>
+        <button id="toggleMicBtn">
+          <img src="microoff.svg" id="iconomicro" />
+        </button>
+        <button id="toggleScreenBtn">
+          <img src="screenshare.svg" id="iconoscreen" />
+        </button>
+      </div>
+    </div>
+
+    <!-- Main content area: grid of videos (left) + participants & chat (right) -->
+    <div id="mainContent">
+      <div id="videosGrid">
+        <!-- LOCAL VIDEO WRAPPER -->
+        <div class="videoWrapper" id="localVideoWrapper">
+          <video id="localVideo" autoplay playsinline muted></video>
+          <div class="usernameLabel" id="localUsernameLabel"></div>
+          
+          <!-- Maximize / Restore Buttons -->
+          <button class="maximizeBtn" id="localMaxBtn">Maximize</button>
+          <button class="restoreBtn hidden" id="localRestoreBtn">Restore</button>
+        </div>
+      </div>
+
+      <!-- Right Pane (participants list on top, chat on bottom) -->
+      <div id="rightPane">
+        <div id="participantsList">
+          <h2>Participantes</h2>
+          <ul id="participantsUl"></ul>
+        </div>
+        <div id="chatContainer">
+          <div id="chatMessages"></div>
+          <div id="chatInputArea">
+            <input type="text" id="chatMessageInput" placeholder="Escribe tu mensaje" />
+            <button id="sendChatBtn">Enviar</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const socket = io();
+
+    // HTML elements
+    const loginOverlay        = document.getElementById('loginOverlay');
+    const usernameInput       = document.getElementById('usernameInput');
+    const joinBtn             = document.getElementById('joinBtn');
+    const conferenceContainer = document.getElementById('conferenceContainer');
+
+    const localVideo          = document.getElementById('localVideo');
+    const localVideoWrapper   = document.getElementById('localVideoWrapper');
+    const localUsernameLabel  = document.getElementById('localUsernameLabel');
+
+    // Maximize / restore buttons for local video
+    const localMaxBtn         = document.getElementById('localMaxBtn');
+    const localRestoreBtn     = document.getElementById('localRestoreBtn');
+
+    const toggleCameraBtn     = document.getElementById('toggleCameraBtn');
+    const toggleMicBtn        = document.getElementById('toggleMicBtn');
+    const toggleScreenBtn     = document.getElementById('toggleScreenBtn');
+
+    const iconomicro          = document.getElementById('iconomicro');
+    const iconocamara         = document.getElementById('iconocamara');
+    const iconoscreen         = document.getElementById('iconoscreen');
+
+    const videosGrid          = document.getElementById('videosGrid');
+    const chatMessages        = document.getElementById('chatMessages');
+    const chatMessageInput    = document.getElementById('chatMessageInput');
+    const sendChatBtn         = document.getElementById('sendChatBtn');
+    const participantsUl      = document.getElementById('participantsUl');
+
+    let localStream                = null;
+    let peers                      = {};   // { userId: { pc, username } }
+    let myUsername                 = "";
+    let roomId                     = "myRoom";  // fixed room example
+    let cameraOn                   = false;
+    let micOn                      = false;
+    let screenOn                   = false;
+    let cameraWasOnBeforeScreen    = false;
+
+    // Audio analyzers for active-speaker detection
+    let audioAnalyzers = {};
+
+    // ---------------------------------------------------
+    // 1) LOGIN
+    // ---------------------------------------------------
+    joinBtn.addEventListener('click', () => {
+      myUsername = usernameInput.value.trim();
+      if (!myUsername) {
+        alert("Please enter a name!");
+        return;
+      }
+      // Hide login overlay, show conference
+      loginOverlay.style.display = 'none';
+      conferenceContainer.classList.remove('hidden');
+
+      // Set local video label
+      localUsernameLabel.textContent = myUsername;
+
+      // Join the room (no A/V started yet)
+      socket.emit('join-room', { roomId, username: myUsername });
+    });
+
+    // ---------------------------------------------------
+    // 2) TOGGLE CAMERA
+    // ---------------------------------------------------
+    toggleCameraBtn.addEventListener('click', async () => {
+      cameraOn = !cameraOn;
+      // If user tries to turn on camera:
+      if (cameraOn) {
+        // Turn off screen if it was on
+        if (screenOn) {
+          await stopScreenShare();
+          screenOn = false;
+          iconoscreen.setAttribute("src", "screenshare.svg");
+        }
+        await setMediaTracks({ video: true, audio: micOn });
+        iconocamara.setAttribute("src", "camaraon.svg");
+      } else {
+        // Turn camera off
+        await setMediaTracks({ video: false, audio: micOn });
+        iconocamara.setAttribute("src", "camaraoff.svg");
+      }
+    });
+
+    // ---------------------------------------------------
+    // 3) TOGGLE MIC
+    // ---------------------------------------------------
+    toggleMicBtn.addEventListener('click', async () => {
+      micOn = !micOn;
+      await setMediaTracks({ video: cameraOn, audio: micOn });
+      iconomicro.setAttribute("src", micOn ? "microon.svg" : "microoff.svg");
+    });
+
+    // ---------------------------------------------------
+    // 4) TOGGLE SCREEN SHARE
+    // ---------------------------------------------------
+    toggleScreenBtn.addEventListener('click', async () => {
+      screenOn = !screenOn;
+      if (screenOn) {
+        // Remember if the camera was on
+        cameraWasOnBeforeScreen = cameraOn;
+
+        // Stop camera if it's on
+        if (cameraOn) {
+          await setMediaTracks({ video: false, audio: micOn });
+          cameraOn = false;
+          iconocamara.setAttribute("src", "camaraoff.svg");
+        }
+        await startScreenShare();
+        iconoscreen.setAttribute("src", "screenshareon.svg");
+      } else {
+        // Stop screen
+        await stopScreenShare();
+        iconoscreen.setAttribute("src", "screenshare.svg");
+        // If camera was on before screen sharing, restore it
+        if (cameraWasOnBeforeScreen) {
+          cameraOn = true;
+          await setMediaTracks({ video: true, audio: micOn });
+          iconocamara.setAttribute("src", "camaraon.svg");
+        }
+      }
+    });
+
+    // ---------------------------------------------------
+    // SCREEN SHARE UTILS
+    // ---------------------------------------------------
+    async function startScreenShare() {
+      try {
+        const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+        replaceLocalTracks(screenStream.getVideoTracks(), 'video');
+      } catch (err) {
+        console.error("Error accessing screen share", err);
+        screenOn = false;
+      }
+    }
+
+    async function stopScreenShare() {
+      if (!localStream) return;
+      const screenTrack = localStream.getVideoTracks()[0];
+      if (screenTrack) {
+        screenTrack.stop();
+        localStream.removeTrack(screenTrack);
+      }
+    }
+
+    // ---------------------------------------------------
+    // SET MEDIA TRACKS (CAMERA / MIC)
+    // ---------------------------------------------------
+    async function setMediaTracks(constraints) {
+      try {
+        if (!constraints.video && !constraints.audio) {
+          // user turned everything off
+          if (localStream) {
+            localStream.getTracks().forEach(t => t.stop());
+          }
+          localStream = null;
+          removeAllLocalTracksFromPeers();
+          // Clear local video preview
+          localVideo.srcObject = null;
+          return;
+        }
+
+        const newStream = await navigator.mediaDevices.getUserMedia({
+          video: constraints.video,
+          audio: constraints.audio
+        });
+        replaceLocalTracks(newStream.getVideoTracks(), 'video');
+        replaceLocalTracks(newStream.getAudioTracks(), 'audio');
+      } catch (err) {
+        console.error("Error getting user media", err);
+        alert("Could not access camera/microphone. Check permissions or SSL.");
+        cameraOn = false;
+        micOn = false;
+        iconocamara.setAttribute("src", "camaraoff.svg");
+        iconomicro.setAttribute("src", "microoff.svg");
+      }
+    }
+
+    function replaceLocalTracks(newTracks, kind) {
+      if (!localStream) {
+        localStream = new MediaStream();
+      }
+      // Remove old tracks of this kind
+      localStream.getTracks().forEach(track => {
+        if (track.kind === kind) {
+          localStream.removeTrack(track);
+          track.stop();
+        }
+      });
+      // Add new
+      newTracks.forEach(track => localStream.addTrack(track));
+      // Update local video preview if these are video tracks
+      if (kind === 'video') {
+        localVideo.srcObject = localStream;
+      }
+      // (Re)start audio-level meter
+      if (kind === 'audio') {
+        startAudioLevelMeter(localStream, 'local');
+      }
+      // Update each peer connection
+      Object.values(peers).forEach(({ pc }) => {
+        const senders = pc.getSenders().filter(s => s.track && s.track.kind === kind);
+        // Remove old senders
+        senders.forEach(sender => pc.removeTrack(sender));
+        // Add new
+        newTracks.forEach(track => pc.addTrack(track, localStream));
+      });
+    }
+
+    function removeAllLocalTracksFromPeers() {
+      Object.values(peers).forEach(({ pc }) => {
+        pc.getSenders().forEach(sender => {
+          if (sender.track) {
+            sender.track.stop();
+            pc.removeTrack(sender);
+          }
+        });
+      });
+    }
+
+    // ---------------------------------------------------
+    // AUDIO LEVEL DETECTION
+    // ---------------------------------------------------
+    function startAudioLevelMeter(stream, userId) {
+      if (!stream || !stream.getAudioTracks().length) return;
+
+      // If there's already an analyzer for this user, close it
+      if (audioAnalyzers[userId]) {
+        audioAnalyzers[userId].audioContext.close();
+        delete audioAnalyzers[userId];
+      }
+
+      let audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      let analyser = audioContext.createAnalyser();
+      analyser.fftSize = 256;
+      let source = audioContext.createMediaStreamSource(stream);
+      source.connect(analyser);
+
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+      function checkLevel() {
+        if (!audioContext || audioContext.state === 'closed') return;
+        analyser.getByteFrequencyData(dataArray);
+        let sum = dataArray.reduce((acc, val) => acc + val, 0);
+        let average = sum / dataArray.length;
+
+        let videoWrapper =
+          userId === 'local'
+            ? localVideoWrapper
+            : document.getElementById('wrapper_' + userId);
+
+        if (videoWrapper) {
+          if (average > 30) {
+            videoWrapper.style.border = '4px solid navajowhite';
+          } else {
+            videoWrapper.style.border = '4px solid white';
+          }
+        }
+        requestAnimationFrame(checkLevel);
+      }
+      checkLevel();
+
+      audioAnalyzers[userId] = { audioContext, analyser, source };
+    }
+
+    // ---------------------------------------------------
+    // PEER CONNECTIONS
+    // ---------------------------------------------------
+    function createPeerConnection(userId) {
+      // Add a TURN server for reliable NAT traversal
+      const pc = new RTCPeerConnection({
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' }
+        ]
+      });
+		/*
+			,
+          {
+            urls: 'turn:your-turn-server.example.com:3478',
+            username: 'turnUser',
+            credential: 'turnPass'
+          }
+		*/
+      // Add tracks if we have localStream
+      if (localStream) {
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+      }
+
+      pc.ontrack = event => {
+        // Attach the remote track to a video element
+        addRemoteVideo(userId, event.streams[0]);
+      };
+
+      pc.onicecandidate = event => {
+        if (event.candidate) {
+          socket.emit('signal', { to: userId, signal: { candidate: event.candidate } });
+        }
+      };
+      return pc;
+    }
+
+    // ---------------------------------------------------
+    // ADD/REMOVE REMOTE VIDEO
+    // ---------------------------------------------------
+    function addRemoteVideo(userId, stream) {
+      let videoWrapper = document.getElementById('wrapper_' + userId);
+      if (!videoWrapper) {
+        // Create a new videoWrapper for this user
+        videoWrapper = document.createElement('div');
+        videoWrapper.classList.add('videoWrapper');
+        videoWrapper.id = 'wrapper_' + userId;
+
+        // Video element
+        const remoteVideo = document.createElement('video');
+        remoteVideo.id = 'video_' + userId;
+        remoteVideo.autoplay = true;
+        remoteVideo.playsInline = true;
+        videoWrapper.appendChild(remoteVideo);
+
+        // Username Label
+        const remoteLabel = document.createElement('div');
+        remoteLabel.classList.add('usernameLabel');
+        remoteLabel.id = 'label_' + userId;
+        // If we already know the username, set it
+        const userObj = peers[userId];
+        if (userObj) remoteLabel.textContent = userObj.username || userId;
+        videoWrapper.appendChild(remoteLabel);
+
+        // Maximize / Restore Buttons
+        const maxBtn = document.createElement('button');
+        maxBtn.classList.add('maximizeBtn');
+        maxBtn.textContent = 'Maximize';
+        maxBtn.addEventListener('click', () => maximizeVideo(videoWrapper));
+        videoWrapper.appendChild(maxBtn);
+
+        const restoreBtn = document.createElement('button');
+        restoreBtn.classList.add('restoreBtn', 'hidden');
+        restoreBtn.textContent = 'Restore';
+        restoreBtn.addEventListener('click', () => restoreVideo(videoWrapper));
+        videoWrapper.appendChild(restoreBtn);
+
+        videosGrid.appendChild(videoWrapper);
+      }
+
+      // Attach stream to the existing video element
+      const remoteVideo = videoWrapper.querySelector('video');
+      remoteVideo.srcObject = stream;
+
+      // Start audio detection
+      startAudioLevelMeter(stream, userId);
+    }
+
+    function removeRemoteVideo(userId) {
+      const videoWrapper = document.getElementById('wrapper_' + userId);
+      if (videoWrapper) {
+        videoWrapper.remove();
+      }
+      if (audioAnalyzers[userId]) {
+        audioAnalyzers[userId].audioContext.close();
+        delete audioAnalyzers[userId];
+      }
+    }
+
+    // ---------------------------------------------------
+    // MAXIMIZE / RESTORE LOGIC
+    // ---------------------------------------------------
+    // For local video
+    localMaxBtn.addEventListener('click', () => maximizeVideo(localVideoWrapper));
+    localRestoreBtn.addEventListener('click', () => restoreVideo(localVideoWrapper));
+
+    function maximizeVideo(wrapper) {
+      videosGrid.classList.add('maximized');
+      wrapper.classList.add('maximized');
+
+      const maxBtn = wrapper.querySelector('.maximizeBtn');
+      const restoreBtn = wrapper.querySelector('.restoreBtn');
+      if (maxBtn) maxBtn.classList.add('hidden');
+      if (restoreBtn) restoreBtn.classList.remove('hidden');
+    }
+
+    function restoreVideo(wrapper) {
+      videosGrid.classList.remove('maximized');
+      wrapper.classList.remove('maximized');
+
+      const maxBtn = wrapper.querySelector('.maximizeBtn');
+      const restoreBtn = wrapper.querySelector('.restoreBtn');
+      if (maxBtn) maxBtn.classList.remove('hidden');
+      if (restoreBtn) restoreBtn.classList.add('hidden');
+    }
+
+    // ---------------------------------------------------
+    // SOCKET.IO EVENTS
+    // ---------------------------------------------------
+    socket.on('user-joined', async ({ userId, username }) => {
+      // Create a new PeerConnection for this user
+      const pc = createPeerConnection(userId);
+      peers[userId] = { pc, username };
+
+      // Update participants list
+      renderParticipantsList();
+
+      // Create a placeholder video slot so we see them even if no track yet
+      addRemoteVideo(userId, new MediaStream());
+
+      // Now create & send an offer
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit('signal', { to: userId, signal: { sdp: offer } });
+    });
+
+    socket.on('signal', async (data) => {
+      const { from, signal } = data;
+      // If we don't have a peer object for 'from', create it
+      if (!peers[from]) {
+        peers[from] = { pc: createPeerConnection(from), username: "Unknown" };
+        // Also create a placeholder video slot if not present
+        addRemoteVideo(from, new MediaStream());
+        renderParticipantsList();
+      }
+      const pc = peers[from].pc;
+
+      if (signal.sdp) {
+        await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+        if (signal.sdp.type === 'offer') {
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          socket.emit('signal', { to: from, signal: { sdp: answer } });
+        }
+      } else if (signal.candidate) {
+        await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+      }
+    });
+
+    socket.on('user-disconnected', (userId) => {
+      if (peers[userId]) {
+        peers[userId].pc.close();
+        delete peers[userId];
+      }
+      removeRemoteVideo(userId);
+      renderParticipantsList();
+    });
+
+    // ---------------------------------------------------
+    // CHAT
+    // ---------------------------------------------------
+    chatMessageInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        sendChat();
+      }
+    });
+    sendChatBtn.addEventListener('click', sendChat);
+
+    function sendChat() {
+      const msg = chatMessageInput.value.trim();
+      if (msg) {
+        socket.emit('chat-message', msg);
+        chatMessageInput.value = "";
+      }
+    }
+
+    socket.on('chat-message', (data) => {
+      const { username, text } = data;
+      const messageEl = document.createElement('div');
+      messageEl.classList.add('chatMessage');
+      messageEl.innerHTML = `<strong>${username}:</strong> ${text}`;
+      chatMessages.appendChild(messageEl);
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+    });
+
+    // ---------------------------------------------------
+    // PARTICIPANTS LIST
+    // ---------------------------------------------------
+    function renderParticipantsList() {
+      // Clear list
+      participantsUl.innerHTML = "";
+
+      // Local user
+      const liMe = document.createElement('li');
+      liMe.textContent = myUsername + " (You)";
+      participantsUl.appendChild(liMe);
+
+      // Remote peers
+      Object.entries(peers).forEach(([userId, info]) => {
+        const li = document.createElement('li');
+        li.textContent = info.username || userId;
+        participantsUl.appendChild(li);
+      });
+    }
+  </script>
+</body>
+</html>
+
